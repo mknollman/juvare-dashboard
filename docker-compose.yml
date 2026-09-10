@@ -1,0 +1,19 @@
+services:
+  juvare-dashboard:
+    build: .
+    container_name: juvare-dashboard
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - juvare-data:/data
+    environment:
+      # Change this to a random secret; it must match the Cloudflare Worker.
+      INGEST_TOKEN: ${INGEST_TOKEN:?set INGEST_TOKEN in .env}
+      # Comma-separated hospital name substrings to show on the dashboard.
+      HOSPITALS: ${HOSPITALS:-}
+      DATA_DIR: /data
+      WEB_DIR: /app/web
+
+volumes:
+  juvare-data:
