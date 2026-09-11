@@ -1,83 +1,89 @@
-# Juvare ED status dashboard — from your email instead of scraping
-#
-# Juvare's team dashboard is behind an Okta login with hCaptcha, so scraping
-# is fragile. But Juvare *emails* you on every status change, and each email
-# actually contains the ENTIRE regional status snapshot. This project parses
-# those emails and shows the hospitals you care about, colored by status.
+# Juvare EMResource ED Status Dashboard
 
-## How it works
+Track hospital Emergency Department (ED) status from Juvare EMResource's
+daily **status-change emails** instead of scraping.
 
-    Outlook rule: forward EMResource emails to juvare@your.domain
-        ⬇
-    Cloudflare Email Routing (free) routes juvare@your.domain to a Worker
-        ⬇
-    Worker POSTs the raw email to https://your-tunnel/api/ingest
-    (+ X-Ingest-Token secret)
-        ⬇
-    This app (VPS via Portainer):
-      • parses hospital/status/time from each email
-      • merges a running regional snapshot
-      • appends change events to history
-      • serves the web dashboard
+> Why not scrape? Juvare's team dashboard sits behind an Okta login with an
+> hCaptcha challenge, so headless scraping is fragile and the EMResource API
+> license is expensive. But Juvare **emails you on every status change**, and
+> each email actually contains the **entire regional status snapshot**. This
+> project just parses those emails and shows the hospitals you care about,
+> color-coded by status.
 
-The app keeps running; data lives in the `juvare-data` volume
-(snapshot.json + history.json).
+Live example: `https://hospitals.knollman.net`
 
-## One-time Cloudflare + Outlook setup
+---
 
-1. Cloudflare Email Routing (Dashboard > your domain > Email):
-   - First add+verify a destination address (any working email).
-   - Create custom address   juvare@yourdomain
-     - send to: Worker  →  "Send to a Worker"  →  create Worker.
-   - Cloudflare adds the MX/SPF records automatically (no DNS work for you).
+## In two lines
 
-2. Cloudflare Worker (zero-dependency):
-   - Create Worker > paste scripts/worker.js.
-   - Environment variables:
-       INGEST_TOKEN = <the same secret as below>
-       WEBHOOK_URL  = https://dashboard.<yourdomain>/api/ingest
-       (point this at your Cloudflare Tunnel hostname)
-   - Deploy, then wire the custom address route to it.
+- An Outlook rule forwards each `no-reply@appmail.juvare.com` email to
+  `juvare@yourdomain`.
+- Cloudflare Email Routing hands it to a Worker, which POSTs the raw email to
+  a small Python service on your VPS. That service parses the email, merges a
+  running regional snapshot, writes `snapshot.json` + `history.json`, and
+  serves the dashboard.
 
-3. Outlook rule:
-   - New rule: from EMResource <no-reply@appmail.juvare.com>
-     → forward to juvare@yourdomain
+## Repository layout
 
-## Local run (no Docker)
+```
+app/
+  main.py          entrypoint: starts the HTTP server
+  server.py        stdlib HTTP server: /api/ingest, /api/snapshot, /api/history, static site
+  emailparser.py   parses Juvare emails into events + regional snapshots
+  config.py        config from environment (with a tiny .env loader)
+web/
+  index.html       dashboard page
+  app.js           fetches the API, renders status cards + timeline
+  style.css        dark theme, status colours
+scripts/
+  worker.js        Cloudflare Email Worker (forward email -> webhook)
+docs/
+  ARCHITECTURE.md      end-to-end data flow
+  DEPLOYMENT.md        Portainer + Cloudflare + Outlook setup
+  DEVELOPMENT.md       local dev, testing the ingest API
+  TROUBLESHOOTING.md   common problems and fixes
+  EMAIL_FORMAT.md      anatomy of a Juvare email and the parser rules
+```
 
-    cp .env.example .env   # fill in INGEST_TOKEN + HOSPITALS
-    python app/main.py     # serves http://127.0.0.1:8080
+## Quick start (local, no Docker)
 
-Test the pipeline by POSTing an email body manually:
+```bash
+cp .env.example .env        # set INGEST_TOKEN + HOSPITALS
+python app/main.py          # serves http://127.0.0.1:8080
+```
 
-    curl -X POST http://127.0.0.1:8080/api/ingest \
-         -H "X-Ingest-Token: $INGEST_TOKEN" \
-         -H "Content-Type: text/plain" \
-         -d @sample-email.txt
+Then feed it a real (or sample) email body:
 
-Or with a subject:
+```bash
+curl -X POST http://127.0.0.1:8080/api/ingest \
+     -H "X-Ingest-Token: <your_token>" \
+     -H "Content-Type: text/plain" \
+     -d @sample-email.txt
+```
 
-    curl -X POST ...?subject="EMResource - UC Health West Chester"
+Open `http://127.0.0.1:8080` → the dashboard populates.
 
-The ingest endpoint also accepts JSON: {"subject": ..., "body": ...}.
+## Key configuration
 
-## Deploy to VPS (Portainer)
+| Variable       | Meaning                                                            |
+| -------------- | ------------------------------------------------------------------ |
+| `INGEST_TOKEN` | Shared secret; must match the Cloudflare Worker.                   |
+| `HOSPITALS`    | Hospital name substrings to show, separated by `;` (hospital names contain commas, so commas are literal). |
+| `DATA_DIR`     | Where `snapshot.json` / `history.json` live (default `/data`).     |
+| `WEB_DIR`      | Static dashboard directory (default `/app/web`).                   |
+| `WEB_HOST`     | Bind address (default `0.0.0.0`).                                   |
+| `WEB_PORT`     | Listen port (default `8080`).                                       |
 
-- Stack from this repo (build). Set environment:
-    INGEST_TOKEN  (random secret; must match the Worker)
-    HOSPITALS    = Christ, Kettering, Mercy, Premier, TriHealth, UC Health
-- Add a Cloudflare Tunnel (public hostname) from dashboard.<yourdomain>
-  → http://juvare-dashboard:8080 (or the container IP:8080).
-- curl a test email through the tunnel to confirm end to end.
+Everything is driven by environment variables, so the same image runs locally,
+in Docker, and in Portainer.
 
-## Backfill existing history
+## Documentation
 
-Your inbox still holds past Juvare status emails. Two options:
-- Forward a handful of old ones manually (each one fills ~190 hospital rows),
-  or set the rule to also forward an older folder once.
-- A future optional IMAP sync can pull the whole thread automatically.
-
-## Statuses and colours
-
-Colour mapping lives in web/app.js: divert → red, limited → amber,
-Normal → green, anything else → grey. Only hospitals in HOSPITALS are shown.
+- **[ARCHITECTURE.md](docs/ARCHITECTURE.md)** — the full pipeline and data model.
+- **[DEPLOYMENT.md](docs/DEPLOYMENT.md)** — Portainer stack, Cloudflare Tunnel,
+  Email Worker, Email Routing, and the Outlook rule, step by step.
+- **[DEVELOPMENT.md](docs/DEVELOPMENT.md)** — running and testing the API.
+- **[TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)** — what to check when
+  something breaks.
+- **[EMAIL_FORMAT.md](docs/EMAIL_FORMAT.md)** — the Juvare email format and how
+  the parser handles it.

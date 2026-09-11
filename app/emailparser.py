@@ -20,7 +20,7 @@ Sample email shape:
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 EVENT_RE = re.compile(
@@ -82,7 +82,8 @@ def parse_email(subject="", body=""):
                 "hospital": m.group("hospital").strip(),
                 "old_status": m.group("old_status").strip(),
                 "new_status": m.group("new_status").strip(),
-                "ts": parse_ts(m.group("ts")) or datetime.now().isoformat(),
+                "ts": parse_ts(m.group("ts"))
+                     or datetime.now(timezone.utc).isoformat(),
             }
             continue
         for sep in (" = ", " =", "= "):
@@ -106,7 +107,7 @@ def _apply_event_snapshot(snapshot, event):
 def ingest(cfg, subject, body, received_at=None):
     """Merge one email into snapshot.json + history.json. Returns summary."""
     if received_at is None:
-        received_at = datetime.now().isoformat()
+        received_at = datetime.now(timezone.utc).isoformat()
     event, snapshot = parse_email(subject, body)
     _apply_event_snapshot(snapshot, event)
 
