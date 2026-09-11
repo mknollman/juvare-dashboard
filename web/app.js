@@ -40,7 +40,7 @@ function render(snap) {
     card.innerHTML = `
       <div class="name">${escapeHtml(name)}</div>
       <div class="status"><span class="badge">●</span> ${escapeHtml(status)}</div>
-      <div class="seen">Seen ${fmtIso(st.seen_at)}</div>`;
+      <div class="seen">As of ${fmtIso(st.seen_at)}</div>`;
     cardsEl.appendChild(card);
   }
 }
