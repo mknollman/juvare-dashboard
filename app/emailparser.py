@@ -17,6 +17,7 @@ Sample email shape:
     Trinity Medical Center West = Limited Divert/Operations
     ...
 """
+import html as _html
 import json
 import os
 import re
@@ -29,7 +30,32 @@ EVENT_RE = re.compile(
     r"(?P<old_status>.*?)\s+to\s+(?P<new_status>.*?)\.\s*$"
 )
 
-SNAPSHOT_RE = re.compile(r"report the following ED Status status:")
+# Same event pattern but searchable anywhere in a line/body: Power Automate
+# collapses the email to a single line and prepends a prefix such as
+# "Status Update for Matt Knollman: " before the "On ..." event sentence,
+# so anchoring at line start (^ / match()) misses it.
+EVENT_SEARCH_RE = re.compile(
+    r"On\s+(?P<ts>\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}\s+[A-Z]{2,5})\s+"
+    r"(?P<hospital>.+?)\s+changed\s+ED\s+Status\s+status\s+from\s+"
+    r"(?P<old_status>.*?)\s+to\s+(?P<new_status>.*?)\."
+)
+
+SNAPSHOT_RE = re.compile(r"report the following\s+ED Status status:")
+
+# Statuses observed verbatim in regional snapshots. Used to recover rows when
+# Power Automate collapses the whole email to ONE line ("Name = Status Name
+# = Status ...") so line-splitting cannot separate rows.
+STATUS_VOCAB = (
+    "Limited Divert/Operations",
+    "Divert/At Capacity",
+    "Normal",
+    "N/A",
+)
+SNAPSHOT_ROW_RE = re.compile(
+    r"(?P<name>[^=]+?)\s*=\s*(?P<status>"
+    + "|".join(re.escape(s) for s in STATUS_VOCAB)
+    + r")(?=\s|$)"
+)
 
 TZ_ALIASES = {
     "EDT": "America/New_York",
@@ -64,36 +90,105 @@ def parse_ts(text):
         return None
 
 
+def _normalize_body(body):
+    """Return plain text with newlines preserved where possible.
+
+    Power Automate may hand us HTML (Outlook connector 'Body' is HTML by
+    default) or plain text with newlines collapsed to spaces. Convert block
+    tags to newlines, strip remaining tags, unescape entities.
+    """
+    text = body or ""
+    # Block-level tags -> newline so rows survive HTML stripping.
+    text = re.sub(r"(?i)<\s*(br|/p|/div|/tr|/li|/h\d)[^>]*>", "\n", text)
+    text = re.sub(r"(?i)<\s*(p|div|tr|li)[^>]*>", "\n", text)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
+
+
+def _parse_event(body):
+    """Find the status-change event anywhere in the body (or None)."""
+    for line in body.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = EVENT_RE.match(line)
+        if m:
+            return {
+                "hospital": m.group("hospital").strip(),
+                "old_status": m.group("old_status").strip(),
+                "new_status": m.group("new_status").strip(),
+                "ts": parse_ts(m.group("ts"))
+                or datetime.now(timezone.utc).isoformat(),
+            }
+    # Fallback: single-line/collapsed body, possibly with a prefix before
+    # "On ...". Search instead of line-anchored matching.
+    flat = " ".join(body.split())
+    m = EVENT_SEARCH_RE.search(flat)
+    if m:
+        return {
+            "hospital": m.group("hospital").strip(),
+            "old_status": m.group("old_status").strip(),
+            "new_status": m.group("new_status").strip(),
+            "ts": parse_ts(m.group("ts"))
+            or datetime.now(timezone.utc).isoformat(),
+        }
+    return None
+
+
+def _parse_snapshot(body):
+    """Return {hospital_name: status} for rows after the snapshot marker.
+
+    Only text AFTER 'report the following ED Status status:' is considered,
+    so '=' lines elsewhere (forward headers, comments, URLs) never become
+    fake hospitals. Handles both multi-line bodies (one row per line) and
+    Power Automate single-line bodies (rows space-separated).
+    """
+    m = SNAPSHOT_RE.search(body)
+    if not m:
+        return {}
+    section = body[m.end():]
+    snapshot = {}
+    # Fast path: regex over the whole section catches both multi-line rows
+    # and collapsed single-line rows, as long as the status is known vocab.
+    for rm in SNAPSHOT_ROW_RE.finditer(section):
+        name = " ".join(rm.group("name").split())
+        # The first name still carries the marker's trailing words when the
+        # body has no newline after the marker ("... status: First Hosp").
+        # Nothing precedes it except the marker itself, so keep it whole;
+        # stray prefixes only occur before the marker, which we cut off.
+        status = rm.group("status").strip()
+        if name and status:
+            snapshot[name] = status
+    if snapshot:
+        return snapshot
+    # Fallback for unknown future statuses: classic line-based parse, still
+    # gated behind the marker. Guards length so prose never becomes a row.
+    for line in section.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        for sep in (" = ", " =", "= "):
+            if sep in line:
+                name, _, status = line.partition(sep)
+                name = " ".join(name.split())
+                status = status.strip()
+                if name and status and len(status) <= 60 and "=" not in status:
+                    snapshot[name] = status
+                break
+    return snapshot
+
+
 def parse_email(subject="", body=""):
     """Return (event, snapshot) from an EMResource email.
 
     event:    dict(hospital, old_status, new_status, ts) or None
     snapshot: {hospital_name: status} for every row in the regional list
     """
-    event = None
-    snapshot = {}
-    for line in body.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = EVENT_RE.match(line)
-        if m and not event:
-            event = {
-                "hospital": m.group("hospital").strip(),
-                "old_status": m.group("old_status").strip(),
-                "new_status": m.group("new_status").strip(),
-                "ts": parse_ts(m.group("ts"))
-                     or datetime.now(timezone.utc).isoformat(),
-            }
-            continue
-        for sep in (" = ", " =", "= "):
-            if sep in line:
-                name, _, status = line.partition(sep)
-                name = name.rstrip().strip()
-                status = status.strip()
-                if name and status:
-                    snapshot[name] = status
-                break
+    body = _normalize_body(body)
+    event = _parse_event(body)
+    snapshot = _parse_snapshot(body)
     return event, snapshot
 
 
